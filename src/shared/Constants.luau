@@ -25,7 +25,7 @@ return {
 	MATCH_SIZE = 2, -- players per match (expand for team modes)
 	QUEUE_TTL = 600, -- seconds before a queue entry auto-expires (crash safety net)
 
-	-- ELO
+	--Base ELO K-factor (max MMR delta from a single match)
 	K_FACTOR = 32,
 
 	-- Rarity weights (must sum to 100 for clean percentages, but any positive values work)
