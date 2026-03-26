@@ -1,0 +1,12 @@
+# Project place file
+/RankMatchMakingDemo.rbxlx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+/packages
+/serverpackages
+
+/CLAUDE.md
+sourcemap.json
