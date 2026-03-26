@@ -5,16 +5,22 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Constants = require(ReplicatedStorage.Shared.Constants)
 
+local RANK_THRESHOLDS = Constants.RANK_THRESHOLDS
+local BASE_MMR_SPREAD = Constants.BASE_MMR_SPREAD
+local SPREAD_PER_SECOND = Constants.SPREAD_PER_SECOND
+local MAX_MMR_SPREAD = Constants.MAX_MMR_SPREAD
+local K_FACTOR = Constants.K_FACTOR
+
 local RankCalculator = {}
 
 -- Maps MMR to the highest tier the player qualifies for
 function RankCalculator.getRankTier(mmr: number): string
 	local thresholds = {
-		{ tier = "Diamond", threshold = Constants.RANK_THRESHOLDS.Diamond },
-		{ tier = "Platinum", threshold = Constants.RANK_THRESHOLDS.Platinum },
-		{ tier = "Gold", threshold = Constants.RANK_THRESHOLDS.Gold },
-		{ tier = "Silver", threshold = Constants.RANK_THRESHOLDS.Silver },
-		{ tier = "Bronze", threshold = Constants.RANK_THRESHOLDS.Bronze },
+		{ tier = "Diamond", threshold = RANK_THRESHOLDS.Diamond },
+		{ tier = "Platinum", threshold = RANK_THRESHOLDS.Platinum },
+		{ tier = "Gold", threshold = RANK_THRESHOLDS.Gold },
+		{ tier = "Silver", threshold = RANK_THRESHOLDS.Silver },
+		{ tier = "Bronze", threshold = RANK_THRESHOLDS.Bronze },
 	}
 	for _, entry in thresholds do
 		if mmr >= entry.threshold then
@@ -27,8 +33,8 @@ end
 -- Current eligible MMR spread for a player based on how long they've waited
 function RankCalculator.getMMRSpread(queueJoinTime: number): number
 	local waitSeconds = os.time() - queueJoinTime
-	local spread = Constants.BASE_MMR_SPREAD + (waitSeconds * Constants.SPREAD_PER_SECOND)
-	return math.min(spread, Constants.MAX_MMR_SPREAD)
+	local spread = BASE_MMR_SPREAD + (waitSeconds * SPREAD_PER_SECOND)
+	return math.min(spread, MAX_MMR_SPREAD)
 end
 
 -- Returns true if two queued players are eligible to be matched right now
@@ -47,7 +53,7 @@ end
 
 -- Returns (deltaForWinner, deltaForLoser) — loser delta is always negative
 function RankCalculator.calculateMMRDelta(winner: any, loser: any, kFactor: number?): (number, number)
-	local k = kFactor or Constants.K_FACTOR
+	local k = kFactor or K_FACTOR
 	local expected = expectedScore(winner.mmr, loser.mmr)
 	local delta = math.round(k * (1 - expected))
 	return delta, -delta
