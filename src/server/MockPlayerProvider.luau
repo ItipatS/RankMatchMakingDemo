@@ -56,7 +56,7 @@ function MockPlayerProvider.seed(count: number)
 	for _ = 1, count do
 		table.insert(_pool, makePlayer(randomMMR()))
 	end
-	print(string.format("[MockProvider] Seeded %d players into pool", #_pool))
+	print(string.format("[MockProvider] Seeded %d players into pool", #_pool), _pool)
 end
 
 -- Pop one random player from the pool (simulates a player joining the queue).
