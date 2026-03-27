@@ -57,6 +57,16 @@ A production-ready ranked matchmaking system built on **Roblox MemoryStore**, de
 
 ## Key design decisions
 
+### Bucket structure
+
+The queue snapshot from MemoryStore is bucketed in two levels before any matching happens:
+
+```
+buckets[region][queueType] = { groups... }
+```
+
+Each `(region, queueType)` pair runs its own independent MMR sort and team assembly pass. A group in EU/3v3 never competes with a group in NA/3v3 for the same slot. Adding a new axis (e.g. a game mode) is just another outer key.
+
 ### `queueType` vs party size
 
 Players choose a **match type** (1v1 / 2v2 / 3v3) independently of how many are in their party. A solo player can queue for 3v3; a duo can queue for 2v2 or 3v3. The matchmaker assembles full teams from whatever group sizes are available in the same bracket — a 3v3 team could be `[solo, duo]` or `[trio]` or `[solo, solo, solo]`.
@@ -136,7 +146,7 @@ rojo serve
 - [ ] `Constants.USE_REAL_MEMORYSTORE = true`
 - [ ] Replace `MockPlayerProvider` calls with `Players:GetPlayers()` + DataStore MMR fetch
 - [ ] Wire `MatchmakingService:onMatch()` to actual game session spawning (`TeleportService`)
-- [x] Per-region bucketing in `tick()` — players only match within their region
+- [x] Per-region bucketing — `buckets[region][queueType]`, region shown in match log and queue chips
 - [ ] Tune `BASE_MMR_SPREAD`, `SPREAD_PER_SECOND`, `QUEUE_TICK_RATE` for your CCU
 
 Everything else — untouched.
