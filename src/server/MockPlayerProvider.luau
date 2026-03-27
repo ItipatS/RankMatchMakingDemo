@@ -2,7 +2,6 @@
 -- Single source of all fake player data.
 -- Zero game logic — data only. Every other system is unaware this data is fake.
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RankCalculator = require(script.Parent.RankCalculator)
 
 local MockPlayerProvider = {}
@@ -21,6 +20,7 @@ local REGIONS = { "NA", "EU", "ASIA" }
 
 local _pool: { any } = {}
 local _nextId = 1
+local _groupIdCounter = 0
 
 -- Bell-curve MMR distribution centered at Gold (1200 MMR), std dev ~500.
 -- This gives a realistic rank spread: mostly Gold/Silver, fewer at extremes.
@@ -84,6 +84,92 @@ end
 
 function MockPlayerProvider.poolSize(): number
 	return #_pool
+end
+
+-- Build a group entry from one or two players.
+local function makeGroup(members: { any }): any
+	_groupIdCounter += 1
+	local totalMmr = 0
+	for _, m in members do
+		totalMmr += m.mmr
+	end
+	local avgMmr = math.round(totalMmr / #members)
+	return {
+		groupId = tostring(_groupIdCounter),
+		members = members,
+		avgMmr = avgMmr,
+		size = #members,
+		rank = RankCalculator.getRankTier(avgMmr),
+		region = members[1].region,
+		queueJoinTime = os.time(),
+		claimed = false,
+	}
+end
+
+-- Seed and return a mix of solo and premade duo groups.
+-- soloCount  : players queuing alone (size=1 groups)
+-- duoCount   : premade pairs queuing together (size=2 groups)
+-- Total players = soloCount + duoCount * 2
+function MockPlayerProvider.seedGroups(soloCount: number, duoCount: number?): { any }
+	_pool = {}
+	_nextId = 1
+	_groupIdCounter = 0
+
+	local groups = {}
+
+	for _ = 1, soloCount do
+		local p = makePlayer(randomMMR())
+		table.insert(groups, makeGroup({
+			{ userId = p.userId, displayName = p.displayName, mmr = p.mmr, rank = p.rank, region = p.region },
+		}))
+	end
+
+	for _ = 1, (duoCount or 0) do
+		local p1 = makePlayer(randomMMR())
+		local p2 = makePlayer(randomMMR())
+		table.insert(groups, makeGroup({
+			{ userId = p1.userId, displayName = p1.displayName, mmr = p1.mmr, rank = p1.rank, region = p1.region },
+			{ userId = p2.userId, displayName = p2.displayName, mmr = p2.mmr, rank = p2.rank, region = p2.region },
+		}))
+	end
+
+	print(string.format("[MockProvider] Seeded %d groups (%d solo, %d duo)",
+		#groups, soloCount, duoCount or 0))
+	return groups
+end
+
+-- Seed and return groups of random sizes (1–3) until playerCount players are distributed.
+-- Exercises 1v1, 2v2, and 3v3 code paths in a single run.
+function MockPlayerProvider.seedMixed(playerCount: number): { any }
+	_pool = {}
+	_nextId = 1
+	_groupIdCounter = 0
+
+	local groups = {}
+	local sizeCounts = { 0, 0, 0 }
+	local playersLeft = playerCount
+
+	while playersLeft > 0 do
+		local maxSize = math.min(3, playersLeft)
+		local groupSize = math.random(1, maxSize)
+		local members = {}
+		for _ = 1, groupSize do
+			local p = makePlayer(randomMMR())
+			table.insert(members, {
+				userId = p.userId, displayName = p.displayName,
+				mmr = p.mmr, rank = p.rank, region = p.region,
+			})
+		end
+		table.insert(groups, makeGroup(members))
+		sizeCounts[groupSize] += 1
+		playersLeft -= groupSize
+	end
+
+	print(string.format(
+		"[MockProvider] Seeded %d groups from %d players (%d solo, %d duo, %d trio)",
+		#groups, playerCount, sizeCounts[1], sizeCounts[2], sizeCounts[3]
+	))
+	return groups
 end
 
 return MockPlayerProvider
