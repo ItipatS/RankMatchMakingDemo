@@ -98,13 +98,14 @@ function MemoryStoreAdapter:setAsync(key: string, value: any, ttl: number): bool
 		task.wait() -- simulate async round-trip; yields to let other coroutines run
 		self._store[key] = {
 			value = value,
-			sortKey = value.mmr,
+			sortKey = value.avgMmr or value.mmr,
 			expiresAt = os.time() + ttl,
 		}
 		return true
 	else
 		local ok, err = pcall(function()
-			self._map:SetAsync(key, value, ttl, value.mmr)
+			self._map:SetAsync(key, value, ttl, value.avgMmr or value.mmr)
+			print(string.format("[MemoryStoreAdapter] SetAsync key=%s, MMR=%d, TTL=%d", key, value.mmr, ttl))
 		end)
 		if not ok then
 			warn("[MemoryStoreAdapter] SetAsync failed:", err)
@@ -118,7 +119,7 @@ end
 -- Returns all unclaimed entries whose MMR sort key falls in [minMMR, maxMMR].
 -- Cost: 1 + (items returned) units — mirrors real GetRangeAsync billing.
 function MemoryStoreAdapter:getRangeAsync(minMMR: number, maxMMR: number, limit: number?): { any }
-	local maxItems = limit or 200
+	local maxItems = limit or 100
 	self._stats.getRangeCalls += 1
 
 	if self._isMock then
@@ -144,12 +145,24 @@ function MemoryStoreAdapter:getRangeAsync(minMMR: number, maxMMR: number, limit:
 		return out
 	else
 		local results = {}
+		-- Fetch all items with no bounds, then filter by MMR in Luau.
+		-- The bounds API requires referencing existing keys with valid UTF-8,
+		-- which is fragile for a dynamic queue. For a queue this size it's fine.
 		local ok, data = pcall(function()
-			return self._map:GetRangeAsync(Enum.SortDirection.Ascending, maxItems, minMMR, maxMMR)
+			return self._map:GetRangeAsync(Enum.SortDirection.Ascending, maxItems)
 		end)
 		if ok and data then
+			-- item.sortKey can be nil for entries stored without a sort key (stale data).
+			-- Guard the comparison so we don't throw on nil >= number.
 			for _, item in data do
-				table.insert(results, item.value)
+				if type(item.sortKey) == "number"
+					and item.sortKey >= minMMR
+					and item.sortKey <= maxMMR
+					and item.value
+					and not item.value.claimed
+				then
+					table.insert(results, item.value)
+				end
 			end
 			self:_addUnits(1 + #results)
 		else
@@ -189,21 +202,26 @@ function MemoryStoreAdapter:claimAsync(key: string, ttl: number): boolean
 		return true
 	else
 		local claimed = false
-		local ok, err = pcall(function()
-			self._map:UpdateAsync(key, function(current)
-				if current == nil then
-					return nil
-				end
-				if current.claimed then
-					return nil -- abort: already claimed
-				end
-				current.claimed = true
-				claimed = true
-				return current
-			end, ttl)
-		end)
-		if not ok then
-			warn("[MemoryStoreAdapter] UpdateAsync (claim) failed:", err)
+		-- Retry up to 3 times on RequestThrottled with linear backoff.
+		-- Any other error aborts immediately so we don't block the tick loop.
+		for attempt = 1, 3 do
+			local ok, err = pcall(function()
+				self._map:UpdateAsync(key, function(current)
+					if current == nil then return nil end
+					if current.claimed then return nil end
+					current.claimed = true
+					claimed = true
+					return current
+				end, ttl)
+			end)
+			if ok then
+				break
+			elseif tostring(err):find("RequestThrottled") then
+				task.wait(0.3 * attempt)
+			else
+				warn("[MemoryStoreAdapter] UpdateAsync (claim) failed:", err)
+				break
+			end
 		end
 		return claimed
 	end
@@ -272,7 +290,7 @@ end
 -- Returns all unclaimed, non-expired entries sorted by MMR ascending.
 -- In production this uses GetRangeAsync with a full MMR sweep.
 function MemoryStoreAdapter:getSnapshotAsync(): { any }
-	return self:getRangeAsync(0, 9999, 200)
+	return self:getRangeAsync(0, 9999, 100)
 end
 
 -- Count of currently active (unclaimed, non-expired) entries.

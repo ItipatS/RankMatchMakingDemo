@@ -1,7 +1,11 @@
 -- MatchmakingService.luau
--- Orchestrates the queue loop. Treats every player identically — mock or real.
--- The CAS claim pattern (claimAsync → match → removeAsync, or claimAsync → releaseAsync on failure)
--- is what makes this safe across multiple concurrent servers.
+-- TEAM_SIZE-vs-TEAM_SIZE matchmaking supporting solo players and premade groups.
+-- Groups of any size ≤ TEAM_SIZE queue as a single entry. The matchmaker assembles
+-- virtual teams from those groups, then matches two teams by avgMmr + spread.
+--
+-- CAS claim covers every group in both teams atomically:
+--   claim all teamA groups → claim all teamB groups → commit
+--   any failure → release everything claimed so far
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Constants = require(ReplicatedStorage.Shared.Constants)
@@ -15,84 +19,120 @@ function MatchmakingService.new(adapter: any)
 	self._adapter = adapter
 	self._running = false
 	self._tickCount = 0
+	self._totalMatches = 0
 	self._onMatch = nil
+	self._onTick = nil
+	self._recentMatches = {}
 	return self
 end
 
--- Register a callback to receive match results.
 function MatchmakingService:onMatch(callback: (any) -> ())
 	self._onMatch = callback
 end
 
--- Add a player to the shared queue.
+function MatchmakingService:onTick(callback: (any) -> ())
+	self._onTick = callback
+end
+
+-- Enqueue a group (solo or premade). One MemoryStore entry per group.
+function MatchmakingService:enqueueGroup(group: any): boolean
+	local key = "group_" .. group.groupId
+	return self._adapter:setAsync(key, group, Constants.QUEUE_TTL)
+end
+
+-- Backward compat: wrap a single player as a size-1 group.
+-- Stress test and old call sites use this path.
 function MatchmakingService:enqueue(player: any): boolean
-	local entry = {
-		userId = player.userId,
-		displayName = player.displayName,
-		mmr = player.mmr,
+	local group = {
+		groupId = tostring(player.userId),
+		members = {{
+			userId = player.userId,
+			displayName = player.displayName,
+			mmr = player.mmr,
+			rank = player.rank,
+			region = player.region,
+		}},
+		avgMmr = player.mmr,
+		size = 1,
 		rank = player.rank,
 		region = player.region,
 		queueJoinTime = player.queueJoinTime,
 		claimed = false,
 	}
-	local key = "player_" .. player.userId
-	return self._adapter:setAsync(key, entry, Constants.QUEUE_TTL)
+	return self:enqueueGroup(group)
 end
 
-local function entryKey(entry: any): string
-	return "player_" .. entry.userId
-end
+-- Attempt to atomically claim all groups in both teams, then commit the match.
+-- CAS order: teamA groups first, then teamB groups.
+-- On any claim failure: release all keys claimed so far and return false.
+function MatchmakingService:_tryMatchTeams(teamA: any, teamB: any): boolean
+	local allGroups = {}
+	for _, g in teamA.groups do table.insert(allGroups, g) end
+	for _, g in teamB.groups do table.insert(allGroups, g) end
 
--- Attempt to atomically claim both players and form a match.
--- Returns true only if both were claimed and removed successfully.
---
--- Why two-phase claim?
---   We need to reserve both players before committing the match.
---   If we could only claim A, B might simultaneously be claimed by another server.
---   The release on B-failure ensures A doesn't get stuck as "claimed but unmatched".
-function MatchmakingService:_tryMatch(entryA: any, entryB: any): boolean
-	if not RankCalculator.isEligibleMatch(entryA, entryB) then
+	local claimedKeys = {}
+	local success = true
+
+	for _, g in allGroups do
+		local key = "group_" .. g.groupId
+		if self._adapter:claimAsync(key, Constants.QUEUE_TTL) then
+			table.insert(claimedKeys, key)
+		else
+			success = false
+			break
+		end
+	end
+
+	if not success then
+		for _, key in claimedKeys do
+			self._adapter:releaseAsync(key, Constants.QUEUE_TTL)
+		end
 		return false
 	end
 
-	local keyA = entryKey(entryA)
-	local keyB = entryKey(entryB)
-
-	-- Phase 1: claim A
-	local claimedA = self._adapter:claimAsync(keyA, Constants.QUEUE_TTL)
-	if not claimedA then
-		return false -- A was already taken by another server
+	-- All claimed — permanently remove from queue
+	for _, key in claimedKeys do
+		self._adapter:removeAsync(key)
 	end
 
-	-- Phase 2: claim B
-	local claimedB = self._adapter:claimAsync(keyB, Constants.QUEUE_TTL)
-	if not claimedB then
-		-- Roll back A so it can be matched with someone else
-		self._adapter:releaseAsync(keyA, Constants.QUEUE_TTL)
-		return false
+	-- Flatten group members into team rosters
+	local membersA, membersB = {}, {}
+	for _, g in teamA.groups do
+		for _, m in g.members do table.insert(membersA, m) end
+	end
+	for _, g in teamB.groups do
+		for _, m in g.members do table.insert(membersB, m) end
 	end
 
-	-- Both claimed — remove from queue and fire the match result
-	self._adapter:removeAsync(keyA)
-	self._adapter:removeAsync(keyB)
-
-	-- Simulate outcome: random winner (in a real game this is determined post-match)
-	local winner, loser
-	if math.random() > 0.5 then
-		winner, loser = entryA, entryB
-	else
-		winner, loser = entryB, entryA
-	end
-
-	local deltaWin, deltaLose = RankCalculator.calculateMMRDelta(winner, loser)
+	-- Team ELO: each team is treated as a single entity at avgMmr
+	local winner = math.random() > 0.5 and "A" or "B"
+	local winnerMmr = winner == "A" and teamA.avgMmr or teamB.avgMmr
+	local loserMmr  = winner == "A" and teamB.avgMmr or teamA.avgMmr
+	local deltaWin, deltaLose = RankCalculator.calculateMMRDelta({ mmr = winnerMmr }, { mmr = loserMmr })
 
 	local result = {
-		playerA = entryA,
-		playerB = entryB,
-		mmrDeltaA = (entryA.userId == winner.userId) and deltaWin or deltaLose,
-		mmrDeltaB = (entryB.userId == winner.userId) and deltaWin or deltaLose,
+		teamA     = membersA,
+		teamB     = membersB,
+		winner    = winner,        -- "A" or "B"
+		mmrDeltaA = winner == "A" and deltaWin or deltaLose,
+		mmrDeltaB = winner == "B" and deltaWin or deltaLose,
+		avgMmrA   = teamA.avgMmr,
+		avgMmrB   = teamB.avgMmr,
+		matchType = string.format("%dv%d", #membersA, #membersB),
 		timestamp = os.time(),
 	}
+
+	self._totalMatches += 1
+	table.insert(self._recentMatches, 1, {
+		teamA  = membersA,
+		teamB  = membersB,
+		winner = winner,
+		deltaA = result.mmrDeltaA,
+		deltaB = result.mmrDeltaB,
+	})
+	if #self._recentMatches > 10 then
+		table.remove(self._recentMatches)
+	end
 
 	if self._onMatch then
 		self._onMatch(result)
@@ -102,79 +142,98 @@ function MatchmakingService:_tryMatch(entryA: any, entryB: any): boolean
 end
 
 -- Run one queue scan.
--- Fetches a snapshot, walks it sorted by MMR, attempts greedy pair matching.
--- Returns the number of matches formed this tick.
--- serverId is optional — used for labelled logging in the stress test.
+-- Groups are bucketed by size — a size-2 group only matches another size-2 group.
+-- This gives you 1v1, 2v2, and 3v3 brackets from a single mixed queue.
+-- Within each bracket the matching is greedy by avgMmr with the spread gate.
 function MatchmakingService:tick(serverId: string?): number
 	self._tickCount += 1
 	local matchesThisTick = 0
 
 	local snapshot = self._adapter:getSnapshotAsync()
-	if #snapshot < 2 then
-		return 0
+	if #snapshot < 2 then return 0 end
+
+	-- Bucket groups by size — each bucket is an independent bracket
+	local buckets: { [number]: { any } } = {}
+	for _, g in snapshot do
+		local size = g.size or 1
+		if not buckets[size] then buckets[size] = {} end
+		table.insert(buckets[size], g)
 	end
 
-	-- Snapshot is already sorted by MMR from the adapter, but sort defensively
-	table.sort(snapshot, function(a, b)
-		return a.mmr < b.mmr
-	end)
+	local usedGroupIds = {}
 
-	-- Track locally which indices we've consumed this tick.
-	-- This is a local optimisation — the CAS is still the real guard against duplicates.
-	local used = {}
+	for _, groups in buckets do
+		-- Sort each bracket by avgMmr so adjacent entries have the closest rating
+		table.sort(groups, function(a, b)
+			return (a.avgMmr or a.mmr) < (b.avgMmr or b.mmr)
+		end)
 
-	for i = 1, #snapshot do
-		if used[i] then
-			continue
-		end
-		local candidate = snapshot[i]
-		local spread = RankCalculator.getMMRSpread(candidate.queueJoinTime)
+		for i = 1, #groups do
+			local gA = groups[i]
+			if usedGroupIds[gA.groupId] then continue end
 
-		for j = i + 1, #snapshot do
-			if used[j] then
-				continue
-			end
-			local other = snapshot[j]
-			-- Snapshot is sorted by MMR ascending; once we exceed spread we can stop scanning
-			if (other.mmr - candidate.mmr) > spread then
-				break
-			end
+			local aAvgMmr = gA.avgMmr or gA.mmr
+			local spread = RankCalculator.getMMRSpread(gA.queueJoinTime)
+			local teamA = { groups = { gA }, avgMmr = aAvgMmr, queueJoinTime = gA.queueJoinTime }
 
-			if self:_tryMatch(candidate, other) then
-				used[i] = true
-				used[j] = true
-				matchesThisTick += 1
-				break
+			for j = i + 1, #groups do
+				local gB = groups[j]
+				if usedGroupIds[gB.groupId] then continue end
+
+				local bAvgMmr = gB.avgMmr or gB.mmr
+				if (bAvgMmr - aAvgMmr) > spread then break end
+
+				local teamB = { groups = { gB }, avgMmr = bAvgMmr, queueJoinTime = gB.queueJoinTime }
+
+				if self:_tryMatchTeams(teamA, teamB) then
+					usedGroupIds[gA.groupId] = true
+					usedGroupIds[gB.groupId] = true
+					matchesThisTick += 1
+					break
+				end
 			end
 		end
 	end
 
-	-- Queue-level logging (only in normal demo mode; stress test does its own reporting)
+	-- Remaining player count: total in snapshot minus those just matched
+	local totalPlayers = 0
+	local matchedPlayers = 0
+	for _, g in snapshot do
+		local size = g.size or 1
+		totalPlayers += size
+		if usedGroupIds[g.groupId] then matchedPlayers += size end
+	end
+	local remaining = totalPlayers - matchedPlayers
+
+	local spreadExpandedCount = 0
+	for _, g in snapshot do
+		if RankCalculator.getMMRSpread(g.queueJoinTime) > Constants.BASE_MMR_SPREAD then
+			spreadExpandedCount += (g.size or 1)
+		end
+	end
+
 	if serverId == nil then
-		local remaining = self._adapter:getSizeAsync()
-		local spreadCount = 0
-		for _, entry in snapshot do
-			if RankCalculator.getMMRSpread(entry.queueJoinTime) > Constants.BASE_MMR_SPREAD then
-				spreadCount += 1
-			end
-		end
-		local spreadNote = spreadCount > 0
-			and string.format(" (spread expanded for %d players)", spreadCount)
+		local spreadNote = spreadExpandedCount > 0
+			and string.format(" (spread expanded for %d players)", spreadExpandedCount)
 			or ""
-		print(
-			string.format(
-				"[Queue] Tick %d — %d players waiting%s",
-				self._tickCount,
-				remaining,
-				spreadNote
-			)
-		)
+		print(string.format("[Queue] Tick %d — %d players waiting%s",
+			self._tickCount, remaining, spreadNote))
+	end
+
+	if self._onTick then
+		self._onTick({
+			tickCount = self._tickCount,
+			matchesThisTick = matchesThisTick,
+			totalMatches = self._totalMatches,
+			queueSize = remaining,
+			spreadExpandedCount = spreadExpandedCount,
+			recentMatches = self._recentMatches,
+		})
 	end
 
 	return matchesThisTick
 end
 
--- Start the continuous queue loop in a background task.
 function MatchmakingService:start(serverId: string?)
 	self._running = true
 	task.spawn(function()
