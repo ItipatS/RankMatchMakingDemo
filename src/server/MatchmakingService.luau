@@ -124,6 +124,7 @@ function MatchmakingService:_tryMatchTeams(teamA: any, teamB: any): boolean
 		avgMmrB   = teamB.avgMmr,
 		matchType = string.format("%dv%d", #membersA, #membersB),
 		timestamp = os.time(),
+		region	= teamA.region,
 	}
 
 	self._totalMatches += 1
@@ -137,6 +138,7 @@ function MatchmakingService:_tryMatchTeams(teamA: any, teamB: any): boolean
 		deltaB     = result.mmrDeltaB,
 		matchType  = result.matchType,
 		timestamp  = os.time(),
+		region	= teamA.region,
 	})
 	if #self._recentMatches > 500 then
 		table.remove(self._recentMatches)
@@ -161,12 +163,15 @@ function MatchmakingService:tick(serverId: string?): number
 	local snapshot = self._adapter:getSnapshotAsync()
 	if #snapshot < 2 then return 0 end
 
-	-- Bucket by queueType — the team size the player selected, independent of group size
-	local buckets: { [number]: { any } } = {}
+	-- Bucket by region then queueType.
+	-- Players only match against others in the same region AND same bracket.
+	local buckets: { [string]: { [number]: { any } } } = {}
 	for _, group in snapshot do
+		local region    = group.region or "NA"
 		local queueType = group.queueType or group.size or 1
-		if not buckets[queueType] then buckets[queueType] = {} end
-		table.insert(buckets[queueType], group)
+		if not buckets[region] then buckets[region] = {} end
+		if not buckets[region][queueType] then buckets[region][queueType] = {} end
+		table.insert(buckets[region][queueType], group)
 	end
 
 	local usedGroupIds = {}
@@ -205,38 +210,40 @@ function MatchmakingService:tick(serverId: string?): number
 		}
 	end
 
-	for queueType, groups in buckets do
-		-- Sort by avgMmr — adjacent groups have the closest MMR
-		table.sort(groups, function(a, b)
-			return (a.avgMmr or a.mmr or 0) < (b.avgMmr or b.mmr or 0)
-		end)
+	for _, regionBuckets in buckets do
+		for queueType, groups in regionBuckets do
+			-- Sort by avgMmr — adjacent groups have the closest MMR
+			table.sort(groups, function(a, b)
+				return (a.avgMmr or a.mmr or 0) < (b.avgMmr or b.mmr or 0)
+			end)
 
-		for i = 1, #groups do
-			local anchor = groups[i]
-			if usedGroupIds[anchor.groupId] then continue end
-			if (anchor.size or 1) > queueType then continue end -- group too large for this bracket
+			for i = 1, #groups do
+				local anchor = groups[i]
+				if usedGroupIds[anchor.groupId] then continue end
+				if (anchor.size or 1) > queueType then continue end -- group too large for this bracket
 
-			local anchorMmr = anchor.avgMmr or anchor.mmr or 0
-			local spread    = RankCalculator.getMMRSpread(anchor.queueJoinTime)
+				local anchorMmr = anchor.avgMmr or anchor.mmr or 0
+				local spread    = RankCalculator.getMMRSpread(anchor.queueJoinTime)
 
-			-- Build teamA starting from anchor (lowest MMR in window)
-			local teamA = assembleTeam(groups, i, {}, anchorMmr, spread, queueType)
-			if not teamA then continue end
+				-- Build teamA starting from anchor (lowest MMR in window)
+				local teamA = assembleTeam(groups, i, {}, anchorMmr, spread, queueType)
+				if not teamA then continue end
 
-			-- Exclude teamA groups from teamB search
-			local excludeA = {}
-			for _, g in teamA.groups do excludeA[g.groupId] = true end
+				-- Exclude teamA groups from teamB search
+				local excludeA = {}
+				for _, g in teamA.groups do excludeA[g.groupId] = true end
 
-			-- Search from index 1 so teamB can be anywhere in the MMR window
-			local teamB = assembleTeam(groups, 1, excludeA, anchorMmr, spread, queueType)
-			if not teamB then continue end
+				-- Search from index 1 so teamB can be anywhere in the MMR window
+				local teamB = assembleTeam(groups, 1, excludeA, anchorMmr, spread, queueType)
+				if not teamB then continue end
 
-			if self:_tryMatchTeams(teamA, teamB) then
-				for _, g in teamA.groups do usedGroupIds[g.groupId] = true end
-				for _, g in teamB.groups do usedGroupIds[g.groupId] = true end
-				matchesThisTick += 1
-				matchesByBracket[queueType] = (matchesByBracket[queueType] or 0) + 1
-				break
+				if self:_tryMatchTeams(teamA, teamB) then
+					for _, g in teamA.groups do usedGroupIds[g.groupId] = true end
+					for _, g in teamB.groups do usedGroupIds[g.groupId] = true end
+					matchesThisTick += 1
+					matchesByBracket[queueType] = (matchesByBracket[queueType] or 0) + 1
+					break
+				end
 			end
 		end
 	end
@@ -247,7 +254,7 @@ function MatchmakingService:tick(serverId: string?): number
 		local queuePlayers = 0
 		for _, g in groups do queuePlayers += (g.size or 1) end
 		bracketStats[queueType] = {
-			bracket         = string.format("%dv%d", queueType, queueType),
+			bracket         = string.format("%sv%s", queueType, queueType),
 			queuePlayers    = queuePlayers,
 			matchesThisTick = matchesByBracket[queueType] or 0,
 			totalMatches    = self._totalMatchesByBracket[queueType] or 0,
@@ -288,6 +295,7 @@ function MatchmakingService:tick(serverId: string?): number
 			local names = {}
 			for _, m in g.members do table.insert(names, m.displayName) end
 			table.insert(queueSnapshot, {
+				region	  = g.region or "NA",
 				label       = table.concat(names, "+"),
 				size        = g.size or 1,
 				queueType   = g.queueType or g.size or 1,

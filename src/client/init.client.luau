@@ -509,8 +509,8 @@ local function createMatchEntry(m)
 	local lRes    = eLabel(11, C.green,   Enum.Font.GothamBold, 4)
 	local lTime   = eLabel(9,  C.textSec, Enum.Font.Gotham,     5)
 
-	lHeader.Text = string.format("[%s]  %s  vs  %s",
-		m.matchType or "?v?", memberNames(m.teamA), memberNames(m.teamB))
+	lHeader.Text = string.format("%s [%s]  %s  vs  %s",
+		m.region or "NA", m.matchType or "?v?", memberNames(m.teamA), memberNames(m.teamB))
 	lA.Text    = "A: " .. memberDetail(m.teamA)
 	lB.Text    = "B: " .. memberDetail(m.teamB)
 	lRes.Text  = string.format("▲ Team %s  %+d / %+d  |  avg %d vs %d",
@@ -597,7 +597,7 @@ local function onData(data)
 		local g = snap[i]
 		if g then
 			chip.frame.Visible = true
-			chip.name.Text = g.label
+			chip.name.Text = string.format("%s - %s",g.region or "NA", g.label)
 			chip.info.Text = string.format("[%dv%d] %dp  %d MMR", g.queueType or g.size, g.queueType or g.size, g.size, g.avgMmr)
 			chip.wait.Text = string.format("%ds waiting", g.waitSeconds)
 		else

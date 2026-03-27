@@ -88,7 +88,7 @@ end)
 
 -- Mixed seed: random distribution of solos, duos, trios across 40 players
 -- Exercises 1v1, 2v2, and 3v3 brackets in a single run
-local groups = MockPlayerProvider.seedMixed(40)
+local groups = MockPlayerProvider.seedMixed(Constants.DEMO_PLAYER_COUNT)
 for _, group in groups do
 	local names = {}
 	for _, m in group.members do table.insert(names, m.displayName) end

@@ -6,7 +6,7 @@ return {
 	USE_REAL_MEMORYSTORE = true,
 
 	-- Set true to run StressTest instead of the normal demo
-	RUN_STRESS_TEST = true,
+	RUN_STRESS_TEST = false,
 	-- Rank MMR thresholds (inclusive lower bound)
 	RANK_THRESHOLDS = {
 		Bronze = 0,
@@ -27,6 +27,7 @@ return {
 	K_FACTOR = 32,
 
 	-- Stress test parameters
+	DEMO_PLAYER_COUNT = 50, -- number of mock players to seed in demo mode
 	STRESS_SERVER_COUNT = 50, -- number of simulated concurrent servers
 	STRESS_PLAYER_COUNT = 500, -- players seeded into the shared queue
 	-- How many consecutive empty-queue ticks before the stress test stops.

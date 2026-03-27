@@ -60,8 +60,12 @@ function DashboardBridge:_fire(triggerIdx: number)
 	local unitsPerMatch = totalMatches > 0
 		and (adapterStats.totalUnits / totalMatches)
 		or  0
+	-- Normalize to per-server rate: totalMatches is shared across all services,
+	-- but tickCount is one server only — divide by numServices so matchesPerTick
+	-- reflects a single server's contribution (matches the stress test print formula).
+	local numServices = math.max(#self._services, 1)
 	local totalTicks = math.max(triggerStats.tickCount or 1, 1)
-	local matchesPerTick = totalMatches / totalTicks
+	local matchesPerTick = (totalMatches / numServices) / totalTicks
 	local projectedPerMin = unitsPerMatch * matchesPerTick * ticksPerMin
 	local budgetPct = math.clamp((projectedPerMin / math.max(budgetPerMin, 1)) * 100, 0, 999)
 
@@ -103,13 +107,12 @@ function DashboardBridge:_fire(triggerIdx: number)
 	end
 
 	self._remote:FireAllClients({
-		mode          = Constants.RUN_STRESS_TEST and "STRESS TEST" or "DEMO",
+		mode          = Constants.RUN_STRESS_TEST and string.format("STRESS TEST Players count(%d), Server count(%d) (Mock MemoryStoreService)", Constants.STRESS_PLAYER_COUNT, Constants.STRESS_SERVER_COUNT) or string.format("DEMO MODE Players count(%d) (Real MemoryStoreService)", Constants.DEMO_PLAYER_COUNT),
 		servers       = servers,
 		recentMatches = recentMatches,
 		-- Bracket stats from the triggering service (shared queue → values converge across services)
 		bracketStats  = triggerStats.bracketStats or {},
 		-- Live queue snapshot — up to 20 waiting groups with label, size, avgMmr, waitSeconds
-		-- queueServerId: which server's tick produced this snapshot (changes each fire)
 		queueSnapshot  = triggerStats.queueSnapshot or {},
 		-- Adapter op counts (cumulative, shared across all servers)
 		totalUnits    = adapterStats.totalUnits,
