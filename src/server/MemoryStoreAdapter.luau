@@ -23,7 +23,7 @@ type MockEntry = {
 	expiresAt: number,
 }
 
-function MemoryStoreAdapter.new(mapName: string)
+function MemoryStoreAdapter.new(mapName: string, useRealMemoryStore: boolean?): any
 	local self = setmetatable({}, MemoryStoreAdapter)
 
 	self._mapName = mapName
@@ -33,9 +33,13 @@ function MemoryStoreAdapter.new(mapName: string)
 		getRangeCalls = 0,
 		updateCalls = 0,
 		removeCalls = 0,
+		totalMatches = 0, -- incremented by recordMatch(); drives units/match metric
 	}
 
-	if USE_REAL_MEMORYSTORE then
+	-- Explicit false overrides the global constant (stress test forces mock regardless of USE_REAL_MEMORYSTORE).
+	-- nil means "use the global default". true/false means "force this mode".
+	local useReal = if useRealMemoryStore ~= nil then useRealMemoryStore else USE_REAL_MEMORYSTORE
+	if useReal then
 		local MemoryStoreService = game:GetService("MemoryStoreService")
 		self._map = MemoryStoreService:GetSortedMap(mapName)
 		self._isMock = false
@@ -69,21 +73,29 @@ end
 function MemoryStoreAdapter:getStats()
 	-- Return a shallow copy so the caller can't mutate internal state
 	return {
-		totalUnits = self._stats.totalUnits,
-		setCalls = self._stats.setCalls,
-		getRangeCalls = self._stats.getRangeCalls,
-		updateCalls = self._stats.updateCalls,
-		removeCalls = self._stats.removeCalls,
+		totalUnits   = self._stats.totalUnits,
+		setCalls     = self._stats.setCalls,
+		getRangeCalls= self._stats.getRangeCalls,
+		updateCalls  = self._stats.updateCalls,
+		removeCalls  = self._stats.removeCalls,
+		totalMatches = self._stats.totalMatches,
 	}
+end
+
+-- Called by MatchmakingService once per committed match.
+-- Lets the dashboard compute units/match instead of units/tick.
+function MemoryStoreAdapter:recordMatch(count: number?)
+	self._stats.totalMatches += (count or 1)
 end
 
 function MemoryStoreAdapter:resetStats()
 	self._stats = {
-		totalUnits = 0,
-		setCalls = 0,
-		getRangeCalls = 0,
-		updateCalls = 0,
-		removeCalls = 0,
+		totalUnits   = 0,
+		setCalls     = 0,
+		getRangeCalls= 0,
+		updateCalls  = 0,
+		removeCalls  = 0,
+		totalMatches = 0,
 	}
 end
 
@@ -105,10 +117,11 @@ function MemoryStoreAdapter:setAsync(key: string, value: any, ttl: number): bool
 	else
 		local ok, err = pcall(function()
 			self._map:SetAsync(key, value, ttl, value.avgMmr or value.mmr)
-			print(string.format("[MemoryStoreAdapter] SetAsync key=%s, MMR=%d, TTL=%d", key, value.mmr, ttl))
 		end)
 		if not ok then
 			warn("[MemoryStoreAdapter] SetAsync failed:", err)
+		else
+			print(key, value)
 		end
 		return ok
 	end

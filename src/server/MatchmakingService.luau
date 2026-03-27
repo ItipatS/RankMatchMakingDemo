@@ -23,6 +23,7 @@ function MatchmakingService.new(adapter: any)
 	self._onMatch = nil
 	self._onTick = nil
 	self._recentMatches = {}
+	self._totalMatchesByBracket = {} -- [teamSize] → total matches formed
 	return self
 end
 
@@ -42,6 +43,7 @@ end
 
 -- Backward compat: wrap a single player as a size-1 group.
 -- Stress test and old call sites use this path.
+-- queueJoinTime defaults to os.clock() so re-queued players get a fresh wait timer.
 function MatchmakingService:enqueue(player: any): boolean
 	local group = {
 		groupId = tostring(player.userId),
@@ -52,12 +54,13 @@ function MatchmakingService:enqueue(player: any): boolean
 			rank = player.rank,
 			region = player.region,
 		}},
-		avgMmr = player.mmr,
-		size = 1,
-		rank = player.rank,
-		region = player.region,
-		queueJoinTime = player.queueJoinTime,
-		claimed = false,
+		avgMmr        = player.mmr,
+		size          = 1,
+		queueType     = player.queueType or 1,
+		rank          = player.rank,
+		region        = player.region,
+		queueJoinTime = player.queueJoinTime or os.clock(),
+		claimed       = false,
 	}
 	return self:enqueueGroup(group)
 end
@@ -90,10 +93,11 @@ function MatchmakingService:_tryMatchTeams(teamA: any, teamB: any): boolean
 		return false
 	end
 
-	-- All claimed — permanently remove from queue
+	-- All claimed — permanently remove from queue and record match for budget tracking
 	for _, key in claimedKeys do
 		self._adapter:removeAsync(key)
 	end
+	self._adapter:recordMatch()
 
 	-- Flatten group members into team rosters
 	local membersA, membersB = {}, {}
@@ -123,14 +127,18 @@ function MatchmakingService:_tryMatchTeams(teamA: any, teamB: any): boolean
 	}
 
 	self._totalMatches += 1
+	local bracketSize = #membersA
+	self._totalMatchesByBracket[bracketSize] = (self._totalMatchesByBracket[bracketSize] or 0) + 1
 	table.insert(self._recentMatches, 1, {
-		teamA  = membersA,
-		teamB  = membersB,
-		winner = winner,
-		deltaA = result.mmrDeltaA,
-		deltaB = result.mmrDeltaB,
+		teamA      = membersA,
+		teamB      = membersB,
+		winner     = winner,
+		deltaA     = result.mmrDeltaA,
+		deltaB     = result.mmrDeltaB,
+		matchType  = result.matchType,
+		timestamp  = os.time(),
 	})
-	if #self._recentMatches > 10 then
+	if #self._recentMatches > 500 then
 		table.remove(self._recentMatches)
 	end
 
@@ -142,9 +150,10 @@ function MatchmakingService:_tryMatchTeams(teamA: any, teamB: any): boolean
 end
 
 -- Run one queue scan.
--- Groups are bucketed by size — a size-2 group only matches another size-2 group.
--- This gives you 1v1, 2v2, and 3v3 brackets from a single mixed queue.
--- Within each bracket the matching is greedy by avgMmr with the spread gate.
+-- Groups are bucketed by queueType (the match type the player chose), not group.size.
+-- A solo queuing for 3v3 and a duo queuing for 3v3 share the same bucket.
+-- Within each bracket the matchmaker assembles two teams of exactly queueType players
+-- from any combination of waiting groups (solo fills one slot, duo fills two, etc.).
 function MatchmakingService:tick(serverId: string?): number
 	self._tickCount += 1
 	local matchesThisTick = 0
@@ -152,47 +161,97 @@ function MatchmakingService:tick(serverId: string?): number
 	local snapshot = self._adapter:getSnapshotAsync()
 	if #snapshot < 2 then return 0 end
 
-	-- Bucket groups by size — each bucket is an independent bracket
+	-- Bucket by queueType — the team size the player selected, independent of group size
 	local buckets: { [number]: { any } } = {}
-	for _, g in snapshot do
-		local size = g.size or 1
-		if not buckets[size] then buckets[size] = {} end
-		table.insert(buckets[size], g)
+	for _, group in snapshot do
+		local queueType = group.queueType or group.size or 1
+		if not buckets[queueType] then buckets[queueType] = {} end
+		table.insert(buckets[queueType], group)
 	end
 
 	local usedGroupIds = {}
+	local matchesByBracket = {}
 
-	for _, groups in buckets do
-		-- Sort each bracket by avgMmr so adjacent entries have the closest rating
+	-- Greedily assembles a team of exactly teamSize players from `groups`.
+	-- Scans from fromIdx, skips groups in usedGroupIds or excludeIds.
+	-- MMR window: [anchorMmr - spread, anchorMmr + spread].
+	-- Returns { groups, avgMmr, queueJoinTime } or nil.
+	local function assembleTeam(groups, fromIdx, excludeIds, anchorMmr, spread, teamSize)
+		local picked    = {}
+		local slotsFilled = 0
+		local totalMmr  = 0
+		local oldestJoin = math.huge
+
+		for j = fromIdx, #groups do
+			local g = groups[j]
+			if usedGroupIds[g.groupId] or excludeIds[g.groupId] then continue end
+			local gMmr  = g.avgMmr or g.mmr or 0
+			if gMmr < anchorMmr - spread then continue end -- below window, keep scanning
+			if gMmr > anchorMmr + spread then break end    -- above window, sorted list ends here
+			local gSize = g.size or 1
+			if slotsFilled + gSize > teamSize then continue end -- too big to fit remaining slots
+			table.insert(picked, g)
+			slotsFilled  += gSize
+			totalMmr     += gMmr * gSize
+			oldestJoin    = math.min(oldestJoin, g.queueJoinTime or math.huge)
+			if slotsFilled == teamSize then break end
+		end
+
+		if slotsFilled ~= teamSize then return nil end
+		return {
+			groups        = picked,
+			avgMmr        = totalMmr / teamSize,
+			queueJoinTime = oldestJoin ~= math.huge and oldestJoin or os.clock(),
+		}
+	end
+
+	for queueType, groups in buckets do
+		-- Sort by avgMmr — adjacent groups have the closest MMR
 		table.sort(groups, function(a, b)
-			return (a.avgMmr or a.mmr) < (b.avgMmr or b.mmr)
+			return (a.avgMmr or a.mmr or 0) < (b.avgMmr or b.mmr or 0)
 		end)
 
 		for i = 1, #groups do
-			local gA = groups[i]
-			if usedGroupIds[gA.groupId] then continue end
+			local anchor = groups[i]
+			if usedGroupIds[anchor.groupId] then continue end
+			if (anchor.size or 1) > queueType then continue end -- group too large for this bracket
 
-			local aAvgMmr = gA.avgMmr or gA.mmr
-			local spread = RankCalculator.getMMRSpread(gA.queueJoinTime)
-			local teamA = { groups = { gA }, avgMmr = aAvgMmr, queueJoinTime = gA.queueJoinTime }
+			local anchorMmr = anchor.avgMmr or anchor.mmr or 0
+			local spread    = RankCalculator.getMMRSpread(anchor.queueJoinTime)
 
-			for j = i + 1, #groups do
-				local gB = groups[j]
-				if usedGroupIds[gB.groupId] then continue end
+			-- Build teamA starting from anchor (lowest MMR in window)
+			local teamA = assembleTeam(groups, i, {}, anchorMmr, spread, queueType)
+			if not teamA then continue end
 
-				local bAvgMmr = gB.avgMmr or gB.mmr
-				if (bAvgMmr - aAvgMmr) > spread then break end
+			-- Exclude teamA groups from teamB search
+			local excludeA = {}
+			for _, g in teamA.groups do excludeA[g.groupId] = true end
 
-				local teamB = { groups = { gB }, avgMmr = bAvgMmr, queueJoinTime = gB.queueJoinTime }
+			-- Search from index 1 so teamB can be anywhere in the MMR window
+			local teamB = assembleTeam(groups, 1, excludeA, anchorMmr, spread, queueType)
+			if not teamB then continue end
 
-				if self:_tryMatchTeams(teamA, teamB) then
-					usedGroupIds[gA.groupId] = true
-					usedGroupIds[gB.groupId] = true
-					matchesThisTick += 1
-					break
-				end
+			if self:_tryMatchTeams(teamA, teamB) then
+				for _, g in teamA.groups do usedGroupIds[g.groupId] = true end
+				for _, g in teamB.groups do usedGroupIds[g.groupId] = true end
+				matchesThisTick += 1
+				matchesByBracket[queueType] = (matchesByBracket[queueType] or 0) + 1
+				break
 			end
 		end
+	end
+
+	-- Build per-bracket stats for the dashboard (keyed by queueType = team size)
+	local bracketStats = {}
+	for queueType, groups in buckets do
+		local queuePlayers = 0
+		for _, g in groups do queuePlayers += (g.size or 1) end
+		bracketStats[queueType] = {
+			bracket         = string.format("%dv%d", queueType, queueType),
+			queuePlayers    = queuePlayers,
+			matchesThisTick = matchesByBracket[queueType] or 0,
+			totalMatches    = self._totalMatchesByBracket[queueType] or 0,
+		}
 	end
 
 	-- Remaining player count: total in snapshot minus those just matched
@@ -220,14 +279,36 @@ function MatchmakingService:tick(serverId: string?): number
 			self._tickCount, remaining, spreadNote))
 	end
 
+	-- Build queue snapshot for the dashboard — up to 20 groups, sorted by MMR.
+	-- waitSeconds is computed here so the client doesn't need server-side clock access.
+	local queueSnapshot = {}
+	for i, g in snapshot do
+		if i > 20 then break end
+		if not usedGroupIds[g.groupId] then -- only show groups still waiting
+			local names = {}
+			for _, m in g.members do table.insert(names, m.displayName) end
+			table.insert(queueSnapshot, {
+				label       = table.concat(names, "+"),
+				size        = g.size or 1,
+				queueType   = g.queueType or g.size or 1,
+				avgMmr      = math.round(g.avgMmr or g.mmr or 0),
+				waitSeconds = math.floor(math.max(0,
+					os.clock() - ((g.queueJoinTime and g.queueJoinTime > 0) and g.queueJoinTime or os.clock())
+				)),
+			})
+		end
+	end
+
 	if self._onTick then
 		self._onTick({
-			tickCount = self._tickCount,
-			matchesThisTick = matchesThisTick,
-			totalMatches = self._totalMatches,
-			queueSize = remaining,
+			tickCount           = self._tickCount,
+			matchesThisTick     = matchesThisTick,
+			totalMatches        = self._totalMatches,
+			queueSize           = remaining,
 			spreadExpandedCount = spreadExpandedCount,
-			recentMatches = self._recentMatches,
+			recentMatches       = self._recentMatches,
+			bracketStats        = bracketStats,
+			queueSnapshot       = queueSnapshot,
 		})
 	end
 
