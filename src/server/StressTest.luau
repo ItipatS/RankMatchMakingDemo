@@ -7,81 +7,144 @@
 --   Each "server" is a coroutine running MatchmakingService:tick().
 --   All coroutines are spawned simultaneously with task.spawn().
 --   Inside claimAsync(), task.wait() yields each coroutine before the atomic read-write,
---   letting other coroutines slip in and attempt to claim the same player.
+--   letting other coroutines slip in and attempt to claim the same group.
 --   Only the first to resume after the yield wins the claim — the rest see claimed=true and back off.
 --   This mirrors how real UpdateAsync atomicity works across Roblox servers.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local Constants         = require(ReplicatedStorage.Shared.Constants)
 local MemoryStoreAdapter = require(script.Parent.MemoryStoreAdapter)
 local MockPlayerProvider = require(script.Parent.MockPlayerProvider)
-local MatchmakingService = require(script.Parent.MatchmakingService)
+local MatchmakingModule  = require(script.Parent.MatchmakingService)
+local DashboardBridge    = require(script.Parent.DashboardBridge)
 
 local StressTest = {}
 
 function StressTest.run()
-	local SERVER_COUNT = Constants.STRESS_SERVER_COUNT
-	local PLAYER_COUNT = Constants.STRESS_PLAYER_COUNT
-	local TICK_ROUNDS = Constants.STRESS_TICK_ROUNDS
+	local SERVER_COUNT  = Constants.STRESS_SERVER_COUNT
+	local PLAYER_COUNT  = Constants.STRESS_PLAYER_COUNT
+	local IDLE_ROUNDS   = Constants.STRESS_IDLE_ROUNDS
 
 	print(string.format(
 		"\n[Stress] ════════════════════════════════════════\n"
-		.. "[Stress] STRESS TEST: %d servers × %d players × %d rounds\n"
+		.. "[Stress] STRESS TEST: %d servers × %d players\n"
+		.. "[Stress] Stops after %d consecutive empty-queue ticks\n"
 		.. "[Stress] ════════════════════════════════════════",
-		SERVER_COUNT, PLAYER_COUNT, TICK_ROUNDS
+		SERVER_COUNT, PLAYER_COUNT, IDLE_ROUNDS
 	))
 
 	-- One shared adapter — all "servers" write and read from the same store,
-	-- exactly like real MemoryStore is shared across all Roblox servers in an experience.
-	local adapter = MemoryStoreAdapter.new("StressQueue")
+	-- exactly like real MemoryStore is shared across all Roblox servers.
+	-- useRealMemoryStore=false overrides the global constant so this
+	-- always runs against the mock even if USE_REAL_MEMORYSTORE=true.
+	local adapter = MemoryStoreAdapter.new("StressQueue", false)
 
-	-- Seed and enqueue all players
-	MockPlayerProvider.seed(PLAYER_COUNT)
-	local players = MockPlayerProvider.drainAll()
-
-	-- Use a temporary service just for bulk enqueue (no match callback needed here)
-	local seeder = MatchmakingService.new(adapter)
-	for _, player in players do
-		seeder:enqueue(player)
+	-- Bulk-enqueue: no delays — stress test measures CAS correctness and unit cost,
+	-- not realistic join timing. Delays here would make the test take minutes.
+	local groups = MockPlayerProvider.seedMixed(PLAYER_COUNT)
+	local seeder = MatchmakingModule.new(adapter)
+	for _, group in groups do
+		seeder:enqueueGroup(group)
 	end
-	print(string.format("[Stress] Enqueued %d players into shared queue", #players))
+	print(string.format("[Stress] Enqueued %d groups (%d players) into shared queue",
+		#groups, PLAYER_COUNT))
 
 	-- ── Duplicate detection ──────────────────────────────────────────────────
 	-- If CAS is broken, the same player can appear in two different match results.
-	-- matchedIds tracks every userId we've ever seen in a result.
-	local matchedIds: { [number]: string } = {} -- userId → matched by which result log
+	-- matchedIds tracks every userId we've ever seen across all servers.
+	local matchedIds: { [number]: string } = {}
 	local totalMatches = 0
 	local duplicatesDetected = 0
 
-	-- Create N service instances, one per simulated server
+	-- Create N service instances, one per simulated server.
+	-- These are separate from the seeder — seeder only enqueues, never ticks.
 	local services = {}
 	for i = 1, SERVER_COUNT do
-		local svc = MatchmakingService.new(adapter)
+		local svc = MatchmakingModule.new(adapter)
 		svc:onMatch(function(result)
-			-- Check both players for duplicates
-			for _, entry in { result.playerA, result.playerB } do
-				if matchedIds[entry.userId] then
-					duplicatesDetected += 1
-					warn(string.format(
-						"[Stress] ✗ DUPLICATE — %s (userId %d) matched twice! (Server-%d)",
-						entry.displayName, entry.userId, i
-					))
-				else
-					matchedIds[entry.userId] = string.format("Server-%d", i)
+			-- CAS check: must happen immediately at match time, not deferred.
+			-- matchedIds tracks "currently in a match". If CAS works, no two servers
+			-- can both hold the same player as claimed at the same instant.
+			for _, team in { result.teamA, result.teamB } do
+				for _, member in team do
+					if matchedIds[member.userId] then
+						duplicatesDetected += 1
+						warn(string.format(
+							"[Stress] ✗ DUPLICATE — %s (userId %d) matched twice! (Server-%d)",
+							member.displayName, member.userId, i
+						))
+					else
+						matchedIds[member.userId] = string.format("Server-%d", i)
+					end
 				end
 			end
 			totalMatches += 1
+
+			-- Re-queue in random group sizes so all brackets stay active.
+			-- Clear matchedIds before re-enqueue so second matches aren't false positives.
+			--[[task.delay(math.random(5, 10), function()
+				local all = {}
+				for _, team in { result.teamA, result.teamB } do
+					for _, m in team do
+						matchedIds[m.userId] = nil
+						table.insert(all, m)
+					end
+				end
+				-- Fisher-Yates shuffle
+				for k = #all, 2, -1 do
+					local j = math.random(1, k)
+					all[k], all[j] = all[j], all[k]
+				end
+				local idx2 = 1
+				local gCounter = 0
+				while idx2 <= #all do
+					local size = math.min(math.random(1, 3), #all - idx2 + 1)
+					local members, totalMmr, ids = {}, 0, {}
+					for k = idx2, idx2 + size - 1 do
+						local m = all[k]
+						table.insert(members, { userId=m.userId, displayName=m.displayName,
+							mmr=m.mmr, rank=m.rank, region=m.region or "NA" })
+						totalMmr += m.mmr
+						table.insert(ids, tostring(m.userId))
+					end
+					gCounter += 1
+					svc:enqueueGroup({
+						groupId       = "rq" .. i .. "_" .. gCounter .. "_" .. table.concat(ids, "_"),
+						members       = members,
+						avgMmr        = totalMmr / size,
+						size          = size,
+						queueType     = math.random(size, 3),
+						region        = members[1].region or "NA",
+						queueJoinTime = os.clock(),
+						claimed       = false,
+					})
+					idx2 += size
+				end
+			end)]]
 		end)
+
 		table.insert(services, svc)
 	end
 
+	-- Wire the dashboard to all services so the client sees a panel per server.
+	-- Pass PLAYER_COUNT as explicit CCU so the budget formula uses the real player count,
+	-- not an approximation derived from the shrinking queue size mid-run.
+	-- Only fires if a client is actually connected — safe to leave in either way.
+	DashboardBridge.new(services, adapter, PLAYER_COUNT):start()
+
 	-- ── Parallel tick rounds ──────────────────────────────────────────────────
-	-- Each round fires all SERVER_COUNT ticks simultaneously,
-	-- then waits for all to finish before moving to the next round.
+	-- Runs indefinitely until the queue has been empty for IDLE_ROUNDS consecutive
+	-- ticks. This lets task.delay() re-queues land and get processed before the
+	-- test declares itself done. Each round fires all SERVER_COUNT ticks in parallel.
 	adapter:resetStats()
 	local totalMatchesPerRound = {}
+	local idleCount = 0
+	local round = 0
 
-	for round = 1, TICK_ROUNDS do
+	local zeromatchesRounds = 0	
+
+	while idleCount < IDLE_ROUNDS do
+		round += 1
 		local roundMatches = 0
 		local finished = 0
 
@@ -93,53 +156,59 @@ function StressTest.run()
 			end)
 		end
 
-		-- Spin-wait for all coroutines to finish this round.
-		-- task.wait() here yields control so spawned coroutines can actually run.
+		-- Spin-wait: task.wait() yields here so spawned coroutines can run.
 		while finished < SERVER_COUNT do
 			task.wait()
 		end
 
 		local remaining = adapter:getSizeAsync()
 		table.insert(totalMatchesPerRound, roundMatches)
-		print(string.format(
-			"[Stress] Round %d/%d — %d matches this round | %d players remaining",
-			round, TICK_ROUNDS, roundMatches, remaining
-		))
 
-		if remaining == 0 then
-			print("[Stress] Queue drained — stopping early")
-			break
+		if remaining == 0 or zeromatchesRounds >= IDLE_ROUNDS then
+			idleCount += 1
+			print(string.format(
+				"[Stress] Round %d — %d matches | queue empty or no more matches (%d/%d idle ticks)",
+				round, roundMatches, idleCount, IDLE_ROUNDS
+			))
+		else
+			idleCount = 0
+			print(string.format(
+				"[Stress] Round %d — %d matches this round | %d players remaining",
+				round, roundMatches, remaining
+			))
+			zeromatchesRounds = roundMatches == 0 and (zeromatchesRounds + 1) or 0
 		end
 
-		task.wait(0.05) -- small pause between rounds
+		task.wait(Constants.QUEUE_TICK_RATE)
 	end
 
+	print("[Stress] Queue idle for " .. IDLE_ROUNDS .. " consecutive ticks — stopping")
+
 	-- ── Rate budget projection ────────────────────────────────────────────────
-	-- Real MemoryStore budget: 1000 + 120 × (concurrent users) units/minute.
-	-- We simulate CCU = PLAYER_COUNT (worst case: everyone is online at once).
 	local stats = adapter:getStats()
 	local roundsRun = #totalMatchesPerRound
 	local ccu = PLAYER_COUNT
 	local budgetPerMinute = 1000 + (120 * ccu)
 	local ticksPerMinute = 60 / Constants.QUEUE_TICK_RATE
-	-- Units used per tick (averaged across rounds and servers)
 	local totalTicks = roundsRun * SERVER_COUNT
 	local unitsPerTick = totalTicks > 0 and (stats.totalUnits / totalTicks) or 0
-	-- Project: one server running the loop alone (production has one matchmaking server)
 	local projectedUnitsPerMinute = unitsPerTick * ticksPerMinute
+	local updateUnitCost = stats.updateCalls * 2
 
-	-- Breakdown: note UpdateAsync costs 2 units per call
-	local updateUnitCost = stats.updateCalls * 2 -- already counted in totalUnits, shown for clarity
+	-- Upper bound on matches: every group finds an opponent in its bracket.
+	-- Actual max is lower because bracket separation means odd-sized buckets
+	-- leave one group unmatched (e.g. 3 solos → only 1 match, 1 solo waits).
+	local maxPossible = math.floor(#groups / 2)
 
 	print("\n[Stress] ════════ RESULTS ════════")
-	print(string.format("[Stress] Players:                %d", PLAYER_COUNT))
+	print(string.format("[Stress] Players:                %d  (%d groups)", PLAYER_COUNT, #groups))
 	print(string.format("[Stress] Servers simulated:      %d", SERVER_COUNT))
 	print(string.format("[Stress] Rounds run:             %d", roundsRun))
-	print(string.format("[Stress] Matches formed:         %d  (max possible: %d)", totalMatches, math.floor(PLAYER_COUNT / 2)))
+	print(string.format("[Stress] Matches formed:         %d  (upper bound: %d)", totalMatches, maxPossible))
 	print(string.format("[Stress] Duplicate matches:      %d  (must be 0)", duplicatesDetected))
 	print("")
 	print("[Stress] ── Op breakdown (request units) ──")
-	print(string.format("  SetAsync calls:      %d   × 1 unit  = %d units", stats.setCalls, stats.setCalls))
+	print(string.format("  SetAsync calls:      %d   × 1 unit  = %d units",  stats.setCalls, stats.setCalls))
 	print(string.format("  GetRangeAsync calls: %d   × variable = (included in total)", stats.getRangeCalls))
 	print(string.format("  UpdateAsync calls:   %d   × 2 units  = %d units", stats.updateCalls, updateUnitCost))
 	print(string.format("  RemoveAsync calls:   %d   × 1 unit   = %d units", stats.removeCalls, stats.removeCalls))
