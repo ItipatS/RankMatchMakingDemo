@@ -86,23 +86,32 @@ function MockPlayerProvider.poolSize(): number
 	return #_pool
 end
 
--- Build a group entry from one or two players.
-local function makeGroup(members: { any }): any
+-- Build a group entry from one or more players.
+-- queueType: the match type the group chose (1=1v1, 2=2v2, 3=3v3). Must be >= #members.
+-- Defaults to #members when not provided (premade fills exactly one team slot).
+local function makeGroup(members: { any }, queueType: number?): any
 	_groupIdCounter += 1
 	local totalMmr = 0
+	local MostMmrPlayer = nil
 	for _, m in members do
 		totalMmr += m.mmr
+		if not MostMmrPlayer or m.mmr > MostMmrPlayer.mmr then
+			MostMmrPlayer = m
+		end
 	end
 	local avgMmr = math.round(totalMmr / #members)
+	local groupSize = #members
 	return {
-		groupId = tostring(_groupIdCounter),
-		members = members,
-		avgMmr = avgMmr,
-		size = #members,
-		rank = RankCalculator.getRankTier(avgMmr),
-		region = members[1].region,
+		groupId       = tostring(_groupIdCounter),
+		members       = members,
+		avgMmr        = avgMmr,
+		size          = groupSize,
+		queueType     = queueType or groupSize, -- desired team size (bucket key)
+		rank          = RankCalculator.getRankTier(avgMmr),
+		region        = members[1].region,
 		queueJoinTime = os.time(),
-		claimed = false,
+		claimed       = false,
+		mostlyMMRPlayer = MostMmrPlayer,
 	}
 end
 
@@ -160,7 +169,11 @@ function MockPlayerProvider.seedMixed(playerCount: number): { any }
 				mmr = p.mmr, rank = p.rank, region = p.region,
 			})
 		end
-		table.insert(groups, makeGroup(members))
+		-- queueType is the match type the group chose, independently of group size.
+		-- A solo (size=1) can queue for 1v1, 2v2, or 3v3.
+		-- A duo (size=2) can queue for 2v2 or 3v3 (can't fit two people in a 1v1 team).
+		local queueType = math.random(groupSize, 3)
+		table.insert(groups, makeGroup(members, queueType))
 		sizeCounts[groupSize] += 1
 		playersLeft -= groupSize
 	end
