@@ -7,6 +7,7 @@
 -- When given multiple services (stress test), each service's latest tickStats is stored
 -- and the full per-server list is included in every payload so the client can show N panels.
 
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Constants = require(ReplicatedStorage.Shared.Constants)
 
@@ -49,25 +50,36 @@ function DashboardBridge:_fire(triggerIdx: number)
 	local adapterStats = self._adapter:getStats()
 	local triggerStats = self._latestStats[triggerIdx] or {}
 
-	-- Budget: use explicit CCU if provided (stress test passes PLAYER_COUNT),
-	-- otherwise approximate from queue + matched players visible to this service.
-	local ccu = self._ccu or ((triggerStats.queueSize or 0) + (triggerStats.totalMatches or 0) * 2)
-	local budgetPerMin = 1000 + (120 * ccu)
-	local ticksPerMin = 60 / Constants.QUEUE_TICK_RATE
-	-- Units/match: stable metric regardless of how full the queue is at tick time.
-	-- Projected units/min = unitsPerMatch × matchesPerTick × ticksPerMin.
 	local totalMatches = adapterStats.totalMatches or 0
 	local unitsPerMatch = totalMatches > 0
 		and (adapterStats.totalUnits / totalMatches)
 		or  0
-	-- Normalize to per-server rate: totalMatches is shared across all services,
-	-- but tickCount is one server only — divide by numServices so matchesPerTick
-	-- reflects a single server's contribution (matches the stress test print formula).
-	local numServices = math.max(#self._services, 1)
-	local totalTicks = math.max(triggerStats.tickCount or 1, 1)
-	local matchesPerTick = (totalMatches / numServices) / totalTicks
-	local projectedPerMin = unitsPerMatch * matchesPerTick * ticksPerMin
-	local budgetPct = math.clamp((projectedPerMin / math.max(budgetPerMin, 1)) * 100, 0, 999)
+
+	-- Budget and rate projection differ by mode.
+	-- Stress test: CCU = mock player count (passed in); rate projection is meaningful
+	--              because the queue runs at steady load.
+	-- Demo mode:   CCU = real connected players (1 in Studio); budget = 1120 units/min.
+	--              Rate projection is meaningless — mock queue drains and empties, not
+	--              representative of production load. Show limit only.
+	local budgetPct, budgetPerMin
+	if Constants.RUN_STRESS_TEST then
+		local ccu = self._ccu or 1
+		budgetPerMin = 1000 + (120 * ccu)
+		local ticksPerMin = 60 / Constants.QUEUE_TICK_RATE
+		local numServices = math.max(#self._services, 1)
+		local totalTicks = math.max(triggerStats.tickCount or 1, 1)
+		local matchesPerTick = (totalMatches / numServices) / totalTicks
+		local projectedPerMin = unitsPerMatch * matchesPerTick * ticksPerMin
+		budgetPct = math.clamp((projectedPerMin / math.max(budgetPerMin, 1)) * 100, 0, 999)
+	else
+		local realCcu = #Players:GetPlayers()
+		budgetPerMin = 1000 + (120 * realCcu)
+		local ticksPerMin = 60 / Constants.QUEUE_TICK_RATE
+		local totalTicks = math.max(triggerStats.tickCount or 1, 1)
+		local matchesPerTick = totalMatches / totalTicks
+		local projectedPerMin = unitsPerMatch * matchesPerTick * ticksPerMin
+		budgetPct = math.clamp((projectedPerMin / math.max(budgetPerMin, 1)) * 100, 0, 999)
+	end
 
 	-- Per-server snapshot — only include services that have ticked at least once
 	local servers = {}
@@ -122,9 +134,9 @@ function DashboardBridge:_fire(triggerIdx: number)
 		removeCalls   = adapterStats.removeCalls,
 		totalMatches  = totalMatches,
 		unitsPerMatch = math.round(unitsPerMatch * 10) / 10, -- 1 decimal place
-		-- Derived
 		budgetPct     = budgetPct,
-		queueServerId  = string.format("Server-%d", triggerIdx),
+		budgetPerMin  = budgetPerMin,
+		queueServerId = string.format("Server-%d", triggerIdx),
 	})
 end
 

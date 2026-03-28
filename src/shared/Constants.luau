@@ -27,7 +27,7 @@ return {
 	K_FACTOR = 32,
 
 	-- Stress test parameters
-	DEMO_PLAYER_COUNT = 50, -- number of mock players to seed in demo mode
+	DEMO_PLAYER_COUNT = 20, -- number of mock players to seed in demo mode
 	STRESS_SERVER_COUNT = 50, -- number of simulated concurrent servers
 	STRESS_PLAYER_COUNT = 500, -- players seeded into the shared queue
 	-- How many consecutive empty-queue ticks before the stress test stops.

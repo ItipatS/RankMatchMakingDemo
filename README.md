@@ -49,8 +49,9 @@ A production-ready ranked matchmaking system built on **Roblox MemoryStore**, de
 | `RankCalculator.luau` | Pure MMR/ELO math, rank tier lookup, spread expansion |
 | `MockPlayerProvider.luau` | All fake player data — the only file aware data is mocked |
 | `DashboardBridge.luau` | Aggregates per-server stats, fires payload to client |
+| `DemoTest.luau` | Single-server demo against real MemoryStore — integration proof |
 | `StressTest.luau` | Multi-server race simulation, CAS proof, budget projection |
-| `init.server.luau` | Entry point — wires everything, starts queue loop or stress test |
+| `init.server.luau` | Entry point — two lines, selects DemoTest or StressTest |
 | `init.client.luau` | Builds and updates the live dashboard UI entirely in code |
 
 ---
@@ -107,43 +108,27 @@ rojo build -o RankMatchMakingDemo.rbxlx
 rojo serve
 ```
 
-**Demo mode** (`RUN_STRESS_TEST = false`): seeds 20 mixed players, runs the queue loop, prints every match to output, shows live dashboard.
+**Demo mode** (`RUN_STRESS_TEST = false`): seeds mock players, runs the queue loop against the **real MemoryStore API**, prints every match to output, shows live dashboard. This mode proves the adapter layer isn't broken — that `SetAsync`, `UpdateAsync`, `RemoveAsync` actually hit Roblox's service and succeed. It is the last integration test before wiring in real players. Budget % on the dashboard is technically computed but not representative: CCU is 1 (the developer in Studio) so the budget limit is only 1,120 units/min, and the mock queue drains to empty rather than sustaining steady-state load.
 
-**Stress test mode** (`RUN_STRESS_TEST = true`): simulates 10 concurrent servers against a shared queue of 200 players. Runs until the queue has been empty for 5 consecutive ticks (covers re-queue delays), then prints a full report.
+**Stress test mode** (`RUN_STRESS_TEST = true`): uses a **mock MemoryStore** (Luau table) to simulate N concurrent servers racing against a shared queue. This is the real architectural proof — it demonstrates CAS correctness under multi-server contention (zero duplicate matches guaranteed), and produces meaningful budget projections because the queue runs at steady load with a known player count. The budget %, units/match, and op breakdown here are representative of what production looks like at that CCU. Runs until the queue has been empty for 5 consecutive ticks (covers re-queue delays), then prints a full report.
 
-### Example stress test output
+### Benchmark screenshots
 
-```
-[Stress] STRESS TEST: 10 servers × 200 players
-[Stress] Stops after 5 consecutive empty-queue ticks
+**Demo test** — real MemoryStore, 20 players, single server:
 
-[Stress] Round 1 — 18 matches this round | 164 players remaining
-[Stress] Round 2 — 14 matches this round | 136 players remaining
-...
-[Stress] Round 8 — 0 matches | queue empty (5/5 idle ticks)
-[Stress] Queue idle for 5 consecutive ticks — stopping
+![Demo Test — output log](public/benchmark/DemoTestLog.png)
+![Demo Test — live dashboard](public/benchmark/DemoTestUI.png)
 
-[Stress] ════════ RESULTS ════════
-[Stress] Players:                200  (74 groups)
-[Stress] Servers simulated:      10
-[Stress] Rounds run:             12
-[Stress] Matches formed:         68  (upper bound: 37)
-[Stress] Duplicate matches:       0  (must be 0)
+**Stress test** — mock MemoryStore, 500 players across 50 concurrent servers:
 
-[Stress] ── Op breakdown (request units) ──
-  SetAsync calls:      74   × 1 unit  = 74 units
-  UpdateAsync calls:   408  × 2 units = 816 units
-  RemoveAsync calls:   204  × 1 unit  = 204 units
-  Total units used:    1094
-
-[Stress] ✓ CAS integrity verified — zero duplicate matches across all servers
-```
+![Stress Test — output log](public/benchmark/StressTestLog.png)
+![Stress Test — live dashboard](public/benchmark/StressTestUI.png)
 
 ---
 
 ## Production checklist
 
-- [ ] `Constants.USE_REAL_MEMORYSTORE = true`
+- [x] `Constants.USE_REAL_MEMORYSTORE = true`
 - [ ] Replace `MockPlayerProvider` calls with `Players:GetPlayers()` + DataStore MMR fetch
 - [ ] Wire `MatchmakingService:onMatch()` to actual game session spawning (`TeleportService`)
 - [x] Per-region bucketing — `buckets[region][queueType]`, region shown in match log and queue chips
@@ -163,7 +148,8 @@ QUEUE_TICK_RATE   = 3      -- seconds between queue scans
 QUEUE_TTL         = 600    -- MemoryStore entry TTL (crash safety)
 K_FACTOR          = 32     -- ELO K-factor (max MMR delta per match)
 
-STRESS_SERVER_COUNT = 10   -- concurrent servers to simulate
-STRESS_PLAYER_COUNT = 200  -- players seeded into the shared queue
+DEMO_PLAYER_COUNT   = 20   -- players seeded in demo mode
+STRESS_SERVER_COUNT = 50   -- concurrent servers to simulate
+STRESS_PLAYER_COUNT = 500  -- players seeded into the shared queue
 STRESS_IDLE_ROUNDS  = 5    -- empty-queue ticks before stress test stops
 ```

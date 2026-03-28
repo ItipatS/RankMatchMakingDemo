@@ -227,7 +227,11 @@ budgetLabel.BackgroundTransparency = 1
 budgetLabel.Size = UDim2.new(1, 0, 0, 24)
 budgetLabel.TextXAlignment = Enum.TextXAlignment.Left
 budgetLabel.LayoutOrder = 2
+budgetLabel.TextWrapped = true
+budgetLabel.AutomaticSize = Enum.AutomaticSize.Y
+budgetLabel.RichText = true
 budgetLabel.Parent = perfPanel
+
 
 makeDivider(perfPanel, 3)
 
@@ -530,7 +534,8 @@ end
 local function onData(data)
 	-- Header
 	modeBadge.Text = data.mode
-	modeBadge.TextColor3 = data.mode == "DEMO" and C.green or C.yellow
+	local isDemo = data.mode and data.mode:find("DEMO") ~= nil
+	modeBadge.TextColor3 = isDemo and C.green or C.yellow
 
 	-- Server list panel
 	local servers = data.servers or {}
@@ -549,7 +554,7 @@ local function onData(data)
 
 	-- Perf panel
 	local pct = data.budgetPct or 0
-	budgetLabel.Text = string.format("Budget used: %.1f%%", pct)
+	budgetLabel.Text = string.format("Budget used: %.1f%%  (limit: %d/min)", pct, data.budgetPerMin or 0)
 	budgetLabel.TextColor3 = budgetColor(pct)
 
 	pRows["Units total"].Text   = string.format("Units total:     %d  (%d matches)", data.totalUnits, data.totalMatches or 0)
@@ -591,6 +596,7 @@ local function onData(data)
 	end
 
 	-- Queue snapshot — horizontal chip strip showing waiting groups
+	qsTitle.Text = "WAITING QUEUE  ·  " .. (data.queueServerId or "—")
 	local snap = data.queueSnapshot or {}
 	for i = 1, MAX_QUEUE_CHIPS do
 		local chip = queueChips[i]
