@@ -108,6 +108,8 @@ rojo build -o RankMatchMakingDemo.rbxlx
 rojo serve
 ```
 
+# Dont forget to publish to Roblox and turn on Enable Studio Access to API Services in studio settings
+
 **Demo mode** (`RUN_STRESS_TEST = false`): seeds mock players, runs the queue loop against the **real MemoryStore API**, prints every match to output, shows live dashboard. This mode proves the adapter layer isn't broken — that `SetAsync`, `UpdateAsync`, `RemoveAsync` actually hit Roblox's service and succeed. It is the last integration test before wiring in real players. Budget % on the dashboard is technically computed but not representative: CCU is 1 (the developer in Studio) so the budget limit is only 1,120 units/min, and the mock queue drains to empty rather than sustaining steady-state load.
 
 **Stress test mode** (`RUN_STRESS_TEST = true`): uses a **mock MemoryStore** (Luau table) to simulate N concurrent servers racing against a shared queue. This is the real architectural proof — it demonstrates CAS correctness under multi-server contention (zero duplicate matches guaranteed), and produces meaningful budget projections because the queue runs at steady load with a known player count. The budget %, units/match, and op breakdown here are representative of what production looks like at that CCU. Runs until the queue has been empty for 5 consecutive ticks (covers re-queue delays), then prints a full report.
